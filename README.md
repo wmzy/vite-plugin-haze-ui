@@ -85,3 +85,4 @@ Resolution base is the *consumer module* (`transform(code, id)`'s `id`), not the
 ## License
 
 MIT
+# vite-plugin-haze-ui
