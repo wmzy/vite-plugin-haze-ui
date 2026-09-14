@@ -7,8 +7,8 @@ import {afterAll, describe, expect, it, vi} from 'vitest';
 import hazeCssDefault, {hazeCss} from '../src/index.ts';
 import type {Plugin} from 'vite';
 
-// —— fixture：tmp 目录内一份假 haze-ui 安装（node_modules/haze-ui）——
-// package.json 不带 exports，让 `haze-ui/css/<x>.css` 直接按子路径落盘。
+// —— fixture：tmp 目录内一份假组件库安装（node_modules/<pkgName>）——
+// package.json 不带 exports，让 `<pkgName>/css/<x>.css` 直接按子路径落盘。
 
 const GOOD_MANIFEST = {
   families: {
@@ -40,30 +40,32 @@ afterAll(async () => {
   );
 });
 
-type FixtureOptions = {manifest?: 'good' | 'broken' | 'none'};
+type FixtureOptions = {manifest?: 'good' | 'broken' | 'none'; pkgName?: string};
 
 async function fixture(options: FixtureOptions = {}) {
+  const pkgName = options.pkgName ?? 'haze-ui';
   const tmp = await fs.promises.mkdtemp(join(tmpdir(), 'vite-plugin-haze-ui-'));
   tmpDirs.push(tmp);
-  const cssDir = join(tmp, 'node_modules', 'haze-ui', 'css');
+  const cssDir = join(tmp, 'node_modules', pkgName, 'css');
   await fs.promises.mkdir(cssDir, {recursive: true});
   await fs.promises.writeFile(
-    join(tmp, 'node_modules', 'haze-ui', 'package.json'),
-    JSON.stringify({name: 'haze-ui', version: '0.0.0-fixture'})
+    join(tmp, 'node_modules', pkgName, 'package.json'),
+    JSON.stringify({name: pkgName, version: '0.0.0-fixture'})
   );
   for (const f of CSS_FILES) {
     await fs.promises.writeFile(join(cssDir, f), `/* ${f} */\n`);
   }
   const kind = options.manifest ?? 'good';
+  const manifestPath = join(cssDir, '..', 'css-manifest.json');
   if (kind !== 'none') {
     await fs.promises.writeFile(
-      join(cssDir, '..', 'css-manifest.json'),
+      manifestPath,
       kind === 'broken' ? '{ 不是 json' : JSON.stringify(GOOD_MANIFEST)
     );
   }
   const consumer = join(tmp, 'app.ts');
   await fs.promises.writeFile(consumer, '');
-  return {tmp, consumer};
+  return {tmp, consumer, manifestPath};
 }
 
 // —— 驱动器：以 mock this 调 plugin.transform ——
@@ -238,12 +240,160 @@ describe('vite-plugin-haze-ui', () => {
     const {result} = run(hazeCss(), `import {Button} from 'haze-ui';\n`, consumer);
     expect(injected(result!)).toContain('import "haze-ui/css/button.css";');
   });
+
+  it('handles aliases, double quotes, multiline and CRLF imports', async () => {
+    const {consumer} = await fixture();
+    const code =
+      `import {Button as Btn} from "haze-ui";\r\n` +
+      `import {\n  Title,\n  Text,\n} from 'haze-ui';\n`;
+    const {result} = run(hazeCss(), code, consumer);
+    expect(injected(result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";',
+      'import "haze-ui/css/typography.css";'
+    ]);
+  });
+
+  it('finds imports on the same line as // inside strings or regex literals', async () => {
+    // 旧 stripComments 正则法会把 '//' 之后的同行内容全当注释吞掉，
+    // 真实 import 静默丢失；es-module-lexer 无此假阴性。
+    const {consumer} = await fixture();
+    const code =
+      `const u = 'http://x'; import {Button} from 'haze-ui';\n` +
+      String.raw`const re = /https?:\/\//; import {Title} from 'haze-ui';` +
+      `\n`;
+    const {result} = run(hazeCss(), code, consumer);
+    expect(injected(result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";',
+      'import "haze-ui/css/typography.css";'
+    ]);
+  });
+
+  it('ignores import-shaped text inside strings and template literals', async () => {
+    const {consumer} = await fixture();
+    const code =
+      `const s = "import {Button} from 'haze-ui';";\n` +
+      'const t = `import {OTPInput} from "haze-ui";`;\n' +
+      'export {};\n';
+    const {result} = run(hazeCss(), code, consumer);
+    expect(result).toBeNull();
+  });
+
+  it('processes source files whose path merely contains "node_modules"', async () => {
+    const {tmp} = await fixture();
+    const dir = join(tmp, 'workspace-node_modules-shim');
+    await fs.promises.mkdir(dir, {recursive: true});
+    const consumer = join(dir, 'App.tsx');
+    await fs.promises.writeFile(consumer, '');
+    const {result} = run(
+      hazeCss(),
+      `import {Button} from 'haze-ui';\n`,
+      consumer
+    );
+    expect(injected(result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ]);
+  });
+
+  it('re-reads the css-manifest when it changes on disk (no restart)', async () => {
+    const {consumer, manifestPath} = await fixture();
+    const code = `import {Button} from 'haze-ui';\n`;
+    expect(injected(run(hazeCss(), code, consumer).result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ]);
+    await fs.promises.writeFile(
+      manifestPath,
+      JSON.stringify({
+        families: {...GOOD_MANIFEST.families, Button: 'typography'},
+        noCss: GOOD_MANIFEST.noCss
+      })
+    );
+    // 强制 mtime 前进，避免粗粒度文件系统同一 tick 内指纹不变
+    await fs.promises.utimes(
+      manifestPath,
+      new Date('2000-01-01'),
+      new Date('2026-01-01')
+    );
+    expect(injected(run(hazeCss(), code, consumer).result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/typography.css";'
+    ]);
+  });
+
+  it('appends the resolution cause when package exports hide ./css/*', async () => {
+    const {tmp} = await fixture();
+    // exports 只暴露 tokens → 组件 css 的 resolve 抛
+    // ERR_PACKAGE_PATH_NOT_EXPORTED，报错需附原始原因而非「文件不存在」
+    await fs.promises.writeFile(
+      join(tmp, 'node_modules', 'haze-ui', 'package.json'),
+      JSON.stringify({
+        name: 'haze-ui',
+        version: '0.0.0-fixture',
+        exports: {'./css/tokens.css': './css/tokens.css'}
+      })
+    );
+    const consumer = join(tmp, 'app.ts');
+    let message = '';
+    try {
+      run(hazeCss(), `import {Button} from 'haze-ui';\n`, consumer);
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    expect(message).toContain('ERR_PACKAGE_PATH_NOT_EXPORTED');
+    expect(message).toContain('Button');
+  });
+
+  it('handles .mts and .cts consumer files', async () => {
+    const {tmp} = await fixture();
+    const mts = join(tmp, 'app.mts');
+    const cts = join(tmp, 'app.cts');
+    await fs.promises.writeFile(mts, '');
+    await fs.promises.writeFile(cts, '');
+    const code = `import {Button} from 'haze-ui';\n`;
+    const expected = [
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ];
+    expect(injected(run(hazeCss(), code, mts).result!)).toEqual(expected);
+    expect(injected(run(hazeCss(), code, cts).result!)).toEqual(expected);
+  });
+
+  it('warns and skips when the module id has no on-disk file', async () => {
+    const {tmp} = await fixture();
+    const {result, warn} = run(
+      hazeCss(),
+      `import {Button} from 'haze-ui';\n`,
+      join(tmp, 'ghost.tsx')
+    );
+    expect(result).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('不存在');
+  });
+
+  it('packageName option scans the configured package', async () => {
+    const {consumer} = await fixture({pkgName: 'haze-x'});
+    const code = `import {Button} from 'haze-x';\n`;
+    // 默认 pkg 不命中其它包
+    expect(run(hazeCss(), code, consumer).result).toBeNull();
+    const {result} = run(hazeCss({packageName: 'haze-x'}), code, consumer);
+    expect(injected(result!)).toEqual([
+      'import "haze-x/css/tokens.css";',
+      'import "haze-x/css/button.css";'
+    ]);
+  });
 });
 
-// —— 真实契约冒烟（gated）：本机存在 haze-ui dist 时才跑 ——
-const REAL_HAZE_UI = '/home/zlt/projects/haze-ui';
-const realManifestPath = join(REAL_HAZE_UI, 'dist', 'css-manifest.json');
-const haveReal = fs.existsSync(realManifestPath);
+// —— 真实契约冒烟（opt-in）：HAZE_UI_PATH 指向本地 haze-ui 开发目录时才跑
+// （如 HAZE_UI_PATH=/home/zlt/projects/haze-ui pnpm test）；CI 与未设置该
+// 环境变量的环境自动 skip。
+const REAL_HAZE_UI = process.env.HAZE_UI_PATH;
+const realManifestPath = REAL_HAZE_UI
+  ? join(REAL_HAZE_UI, 'dist', 'css-manifest.json')
+  : '';
+const haveReal = realManifestPath !== '' && fs.existsSync(realManifestPath);
 
 (haveReal ? describe : describe.skip)('real haze-ui dist contract', () => {
   it('injects button/otp-input/typography against the real css-manifest', async () => {

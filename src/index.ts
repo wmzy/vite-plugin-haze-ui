@@ -1,6 +1,7 @@
 // vite-plugin-haze-ui：haze-ui 按需 CSS 自动注入的 Vite 插件（haze-ui 生态官方
-// 配套插件包）。机制：transform 阶段扫描模块源码里的
-// `import {…} from 'haze-ui'` 具名导入，把用到的组件映射为
+// 配套插件包）。机制：transform 阶段用 es-module-lexer 词法扫描模块源码里的
+// `import {…} from 'haze-ui'` 具名导入（注释/字符串/模板/正则里的形似文本
+// 天然不匹配，既无误识别也无漏识别），把用到的组件映射为
 // `haze-ui/css/<family>.css` 的副作用 import 前置注入该模块——css 文件
 // 随消费模块一起进模块图，去重、分包（懒加载视图只带自己的组件 css）、
 // HMR 全部交给 vite/rollup 原生管道，插件自身零构建状态。
@@ -42,6 +43,7 @@
 // tokens.css 恒定先行——主题变量/spacing/排版基线都在其中，经去重后落在
 // 模块图最前端（入口文件亦导入 haze-ui）。haze-ui 无全局 reset（无
 // body/html/* 规则），不存在漏引基础样式的风险。
+import {parse} from 'es-module-lexer';
 import fs from 'node:fs';
 import {createRequire} from 'node:module';
 import {dirname, isAbsolute, join, resolve} from 'node:path';
@@ -144,9 +146,74 @@ const NO_CSS = new Set([
   'useTitle'
 ]);
 
-// 注入前剥离注释，避免注释里的形似 import 文本被误识别。
-const stripComments = (code: string) =>
-  code.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+// 提取 import 语句具名导入花括号内的原文：首个 '{' 深度配对到对应 '}'，
+// 不受 import attributes（with {…}）等语句尾部花括号干扰。无具名花括号
+// （纯 default / 副作用导入）返回 null。
+function bracedSpecs(stmt: string): string | null {
+  const open = stmt.indexOf('{');
+  if (open === -1) return null;
+  let depth = 0;
+  for (let i = open; i < stmt.length; i++) {
+    const c = stmt[i]!;
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return stmt.slice(open + 1, i);
+  }
+  return null; // 未闭合（词法上不可能，防御）
+}
+
+// 具名导入列表按顶层逗号切分：字符串/模板/正则式与注释内的逗号不参与
+// 切分，类型里的 {…}/[…]/（…) 也不参与（如
+// `import {Button, type Options = {a: string, b: number}}`）。
+function splitSpecs(body: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let quote: '"' | "'" | '`' | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]!;
+    const next = body[i + 1];
+    if (lineComment) {
+      if (c === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (c === '*' && next === '/') {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote !== null) {
+      if (c === '\\') i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '/' && next === '/') {
+      lineComment = true;
+      i++;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      blockComment = true;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      quote = c;
+      continue;
+    }
+    if (c === '{' || c === '[' || c === '(') depth++;
+    else if (c === '}' || c === ']' || c === ')') depth--;
+    else if (c === ',' && depth === 0) {
+      out.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(body.slice(start));
+  return out;
+}
 
 // haze-ui ≥1.22 随包发布的映射清单（dist/css-manifest.json）。三态：
 // absent（未随包发布，走 FAMILY/NO_CSS fallback）/ present（唯一映射源）/
@@ -163,9 +230,12 @@ type ManifestState =
 // 默认解析符号链接，pnpm 的 .pnpm 真实路径即安装身份）。
 type Install = {
   cssDir: string;
+  manifestPath: string;
   // spec → 磁盘真实路径。同一安装内 spec 与文件一一对应，跨消费文件共享。
   resolvedCss: Map<string, string>;
   manifest: ManifestState;
+  // mtime+size 指纹：变化即重读 manifest（dev 下改 haze-ui 无需重启）。
+  manifestFingerprint: string;
 };
 
 const installs = new Map<string, Install>();
@@ -205,6 +275,28 @@ function readManifest(cssDir: string): ManifestState {
   }
 }
 
+// mtime+size 指纹：内容变了就重读（mtime 倒退如 git checkout 旧版同样
+// 触发）。文件缺席恒为 'absent'，新出现时指纹变化亦触发重读。
+function manifestFingerprint(path: string): string {
+  try {
+    const st = fs.statSync(path);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return 'absent';
+  }
+}
+
+// 每次 transform 取一次 manifest 状态：指纹未变走缓存，变了重读。
+// stat 代价与既有的每模块 existsSync 同量级。
+function manifestOf(install: Install): ManifestState {
+  const fp = manifestFingerprint(install.manifestPath);
+  if (fp !== install.manifestFingerprint) {
+    install.manifestFingerprint = fp;
+    install.manifest = readManifest(install.cssDir);
+  }
+  return install.manifest;
+}
+
 // 定位消费文件解析到的组件库安装（tokens.css 为锚点）。resolve 结果是
 // 符号链接解析后的真实路径，天然作为安装身份键。
 function installOf(req: NodeRequire, pkg: string): Install {
@@ -218,10 +310,13 @@ function installOf(req: NodeRequire, pkg: string): Install {
   const dir = dirname(tokensPath);
   let install = installs.get(dir);
   if (install === undefined) {
+    const manifestPath = join(dir, '..', 'css-manifest.json');
     install = {
       cssDir: dir,
+      manifestPath,
       resolvedCss: new Map([[tokensSpec, tokensPath]]),
-      manifest: readManifest(dir)
+      manifest: readManifest(dir),
+      manifestFingerprint: manifestFingerprint(manifestPath)
     };
     installs.set(dir, install);
   }
@@ -264,23 +359,13 @@ function cssFileOf(
   return {file: FAMILY[name] ?? kebab(name), covered: true};
 }
 
-// 正则元字符转义（包名含 @、/、- 等）
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
 export default function hazeCss(options: HazeCssOptions = {}): Plugin {
   const pkg = options.packageName ?? 'haze-ui';
   const tokensSpec = `${pkg}/css/tokens.css`;
 
-  // 具名导入语句：import {A, type B, C as D} from 'haze-ui'（含多行）。
-  // 不匹配 import type 整句（纯类型导入会被完全剥除，无运行时样式需求）。
-  const NAMED_IMPORT_RE = new RegExp(
-    `import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escapeRe(pkg)}['"]`,
-    'g'
-  );
-  // 命名空间导入收集不到任何具名导入，开发期警告提示改具名导入。
-  const NAMESPACE_IMPORT_RE = new RegExp(
-    `import\\s*\\*\\s*as\\s+\\w+\\s+from\\s*['"]${escapeRe(pkg)}['"]`
-  );
+  // 具名导入识别交给 es-module-lexer（见 transform）：注释/字符串/模板/
+  // 正则里的形似 import 天然不匹配，且直接给出语句区间与模块名，无需
+  // 正则与注释剥离。
 
   // dev server 的根相对 id（如 '/src/App.tsx'）不是磁盘路径时，按
   // config.root 补全；configResolved 未跑（如测试直调）时退回 cwd。
@@ -295,39 +380,64 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
       root = config.root;
     },
     transform(code, id) {
-      const raw = id.split('?', 1)[0] ?? id;
-      if (id.startsWith('\0') || raw.includes('node_modules')) return null;
-      if (!/\.[jt]sx?$/.test(raw)) return null;
+      const q = id.indexOf('?');
+      const raw = q === -1 ? id : id.slice(0, q);
+      // 按路径段判 node_modules（子串判断会把 'workspace-node_modules-x'
+      // 这类正常源码目录误杀）
+      if (id.startsWith('\0') || raw.split(/[\\/]/).includes('node_modules')) return null;
+      // js/jsx/ts/tsx + mjs/mts/cjs/cts；vue sfc、css 等交给别的插件
+      if (!/\.[cm]?[jt]sx?$/.test(raw)) return null;
 
-      // dev 根相对 id 的磁盘路径回退（绝对但不在磁盘上的 id 按 root 拼）
-      let file = isAbsolute(raw) ? raw : resolve(root, raw);
-      if (!fs.existsSync(file)) {
-        const rooted = join(root, raw);
-        if (fs.existsSync(rooted)) file = rooted;
+      // dev 根相对 id（如 '/src/App.tsx'）不是磁盘路径时按 config.root
+      // 拼接（join 不做绝对段重置）；绝对路径 resolve 恒等，相对路径
+      // resolve 等价 join(root, raw)。
+      const file =
+        isAbsolute(raw) && !fs.existsSync(raw)
+          ? join(root, raw)
+          : resolve(root, raw);
+
+      // es-module-lexer 词法识别：字符串里的伪 import 不再误注入，'//' 在
+      // 字符串/正则里也不再吞掉同行的真实 import（旧 stripComments 的
+      // 两类缺陷同时消除）。
+      const [imports] = parse(code, id);
+
+      let namespace = false;
+      const names = new Set<string>();
+      for (const im of imports) {
+        if (im.type !== 'static' || im.typeOnly || im.specifier !== pkg) continue;
+        const stmt = code.slice(im.importStart, im.importEnd);
+        // export {X} from / export * from 'haze-ui'（lexer 会列入）不收集：
+        // 文档化边界（转发不注入）
+        if (stmt.startsWith('export')) continue;
+        if (/^import\s*\*/.test(stmt)) {
+          namespace = true;
+          continue;
+        }
+        const body = bracedSpecs(stmt);
+        if (body === null) continue; // 纯 default / 副作用导入
+        for (const spec of splitSpecs(body)) {
+          const name = spec.replace(/\s+as\s+\S+$/, '').trim();
+          // 跳过 inline type 修饰符与空段（尾逗号）
+          if (!name || /^type\s+/.test(name)) continue;
+          names.add(name);
+        }
       }
-
-      const stripped = stripComments(code);
-
-      if (NAMESPACE_IMPORT_RE.test(stripped)) {
+      if (namespace) {
         this.warn(
           `[vite-plugin-haze-ui] ${file} 使用了 \`import * as … from '${pkg}'\`：` +
             '命名空间导入收集不到具名组件，无法按需注入 css。' +
             `请改为具名导入（import {Button} from "${pkg}"）。`
         );
       }
-
-      const names = new Set<string>();
-      for (const match of stripped.matchAll(NAMED_IMPORT_RE)) {
-        const specs = match[1];
-        if (!specs) continue;
-        for (const spec of specs.split(',')) {
-          const name = spec.trim().replace(/\s+as\s+\S+$/, '').trim();
-          // 跳过 inline type 修饰符与空段（尾逗号）
-          if (!name || name.startsWith('type ')) continue;
-          names.add(name);
-        }
-      }
       if (names.size === 0) return null;
+
+      if (!fs.existsSync(file)) {
+        // 无 \0 前缀的虚拟模块等：没有磁盘基准，注入必然落到错误副本
+        this.warn(
+          `[vite-plugin-haze-ui] 模块 id ${id} 无法定位到磁盘文件（${file} 不存在），跳过注入。`
+        );
+        return null;
+      }
 
       // 解析基准 = 导入方文件（独立包正确性的核心，见文件头注释）
       const req = requireOf(file);
@@ -342,8 +452,9 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
         );
       }
 
-      if (install.manifest.kind === 'broken') {
-        this.error(`[vite-plugin-haze-ui] ${install.manifest.problem}`);
+      const manifest = manifestOf(install);
+      if (manifest.kind === 'broken') {
+        this.error(`[vite-plugin-haze-ui] ${manifest.problem}`);
       }
 
       // fail-fast 报错四要素：触发注入的源文件、具名导入名、期望 css
@@ -362,14 +473,25 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
         tokensSpec,
         ...[...names]
           .map((n) => {
-            const {file: base, covered} = cssFileOf(n, install.manifest);
+            const {file: base, covered} = cssFileOf(n, manifest);
             if (base === null) return null;
             const spec = `${pkg}/css/${base}.css`;
             if (!covered) this.error(missingCss(n, spec, true));
             try {
               resolveCss(req, install, spec);
-            } catch {
-              this.error(missingCss(n, spec, false));
+            } catch (e) {
+              // 附上原始解析错误（如 ERR_PACKAGE_PATH_NOT_EXPORTED：
+              // 文件在但 exports 未暴露 ./css/*），区分「文件不存在」与
+              // 「解析受阻」两类根因；node 的 code 在 e.code 上而非
+              // message 内，一并拼入便于检索
+              let detail = '';
+              if (e instanceof Error && e.message) {
+                const code = 'code' in e && typeof e.code === 'string' ? e.code : null;
+                detail = code === null ? e.message : `${code}: ${e.message}`;
+              }
+              this.error(
+                missingCss(n, spec, false) + (detail ? `\n原因：${detail}` : '')
+              );
             }
             return spec;
           })

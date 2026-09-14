@@ -65,16 +65,34 @@ The plugin maps each named export to a css family file in two tiers:
 1. **`dist/css-manifest.json` (haze-ui ≥1.22)** — shipped inside the haze-ui package as `{"families": {exportName: cssFileName}, "noCss": [exportName]}`. When present, it is the *only* mapping source. A malformed/unreadable manifest is a hard error (never a silent fallback — a publishing bug must not degrade into guess-based mapping).
 2. **Built-in fallback tables** (`FAMILY` / `NO_CSS`, plus a kebab-case rule handling acronyms like `OTPInput → otp-input`) — used only when the installed haze-ui does not ship the manifest (≤1.21).
 
-Whichever tier resolves the css file, the plugin verifies on disk — via `require.resolve` **based at the importing file** — that the css actually exists in the haze-ui copy that file consumes. Missing files fail fast with the four essentials: the triggering source file, the import name, the expected css path, and a fix hint.
+Whichever tier resolves the css file, the plugin verifies on disk — via `require.resolve` **based at the importing file** — that the css actually exists in the haze-ui copy that file consumes. Missing files fail fast with the four essentials: the triggering source file, the import name, the expected css path, and a fix hint (resolution errors such as `ERR_PACKAGE_PATH_NOT_EXPORTED` are included verbatim).
+
+The manifest is re-read whenever it changes on disk (mtime+size fingerprint): during dev, editing `css-manifest.json` in a linked haze-ui checkout takes effect on the next transform — no server restart needed.
 
 Resolution base is the *consumer module* (`transform(code, id)`'s `id`), not the plugin's own location — the plugin lives in the consumer's `node_modules`, and resolving from there would be unreliable under pnpm strict layouts and monorepos. Resolution results and manifest state are cached per located install (keyed by the real `dist/css` directory), so multiple haze-ui copies in one monorepo never cross-contaminate.
 
 ## Known boundaries
 
 - Only **direct named imports** from `haze-ui` are recognized. Re-exports through a local barrel (`export {X} from 'haze-ui'`) are not collected — import from `haze-ui` directly in the consuming module.
-- **Namespace imports** (`import * as haze from 'haze-ui'`) collect nothing; the plugin warns in dev and suggests named imports.
+- **Namespace imports** (`import * as haze from 'haze-ui'`) collect nothing; the plugin warns and suggests named imports.
 - File-level granularity: importing a component anywhere in a file injects its css for that file (then deduped by the bundler).
-- `import type` statements and inline `type` specifiers are skipped; imports inside `//` and `/* */` comments are stripped before scanning. Import-shaped text inside string literals may still be misrecognized — accepted, since the worst case is injecting one extra existing css file.
+- Scanning is lexical (`es-module-lexer`): comments, strings, template literals and regex literals are never misread — import-shaped text inside them neither injects css nor suppresses a real import. `import type` statements and inline `type` specifiers are skipped.
+- Handled source extensions: `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.mts`, `.cjs`, `.cts`. Other file types (`.vue` SFCs, etc.) are passed through untouched.
+
+## Development
+
+```bash
+pnpm install
+pnpm test        # fixture-based unit tests
+pnpm typecheck
+pnpm build
+```
+
+The "real haze-ui dist contract" smoke test is opt-in: point `HAZE_UI_PATH` at a local haze-ui checkout (one with `dist/css-manifest.json`) and it runs against the real manifest:
+
+```bash
+HAZE_UI_PATH=/path/to/haze-ui pnpm test
+```
 
 ## Requirements
 
