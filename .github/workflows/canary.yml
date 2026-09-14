@@ -1,0 +1,75 @@
+# Canary 发布通道：手动触发（workflow_dispatch），从任意 ref 构建、以
+# 0.0.0-canary.<sha>.<run> 版本号直发 npm dist-tag `canary`。完全绕过
+# semantic-release——不分析 commit、不创建 git tag / GitHub Release、
+# 不移动 latest dist-tag，供消费者显式 `npm i vite-plugin-haze-ui@canary` 试用。
+name: Canary Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run（只打包不上传）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # npm provenance（发布溯源）需要 OIDC。
+  id-token: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install
+
+      - name: Stamp canary version
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=8 HEAD)"
+          # 末段追加 run number：npm 禁止覆盖已发布的版本号，同一 SHA 被
+          # 再次触发时也能发出新版本并把 canary dist-tag 前移。
+          version="0.0.0-canary.${short_sha}.${GITHUB_RUN_NUMBER}"
+          # --no-git-tag-version：只写 package.json，不建 commit / tag，
+          # runner 文件系统一次性，不会污染仓库。
+          npm version "$version" --no-git-tag-version --allow-same-version
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to dist-tag canary
+        env:
+          # 与 release.yml 复用同一个 NPM_TOKEN secret。
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--tag canary)
+          # prepublishOnly 会再跑一次完整 build，上面已显式构建过，跳过
+          # 生命周期脚本（provenance 由 npm 内部处理，不受影响）。
+          args+=(--ignore-scripts)
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+            echo "dry-run: packing only, no upload"
+          else
+            export NPM_CONFIG_PROVENANCE=true
+          fi
+          echo "publishing vite-plugin-haze-ui@${VERSION}"
+          npm publish "${args[@]}"
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            echo "installed via: npm i vite-plugin-haze-ui@canary  # ${VERSION}"
+          fi

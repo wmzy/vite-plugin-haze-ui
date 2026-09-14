@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: "*"
+  pull_request:
+    branches: "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm test
+      - run: pnpm typecheck
+      - run: pnpm build
+      # Read-only dist health check: top modules by size, appended to the
+      # job summary (no extra tooling — find/sort/numfmt only, nothing is
+      # installed and the build config is untouched).
+      - name: Dist size report (job summary)
+        run: |
+          total=$(du -sb dist | cut -f1)
+          {
+            echo '## dist size report — top 30 modules'
+            echo ''
+            echo '| bytes | size | file |'
+            echo '| ---: | ---: | --- |'
+            find dist -type f -printf '%s\t%p\n' \
+              | sort -rn | head -30 \
+              | while IFS=$'\t' read -r size file; do
+                printf '| %s | %s | `%s` |\n' "$size" "$(numfmt --to=iec --suffix=B "$size")" "$file"
+              done
+            echo ''
+            echo "- **files:** $(find dist -type f | wc -l)"
+            echo "- **total:** ${total} bytes ($(numfmt --to=iec --suffix=B "$total"))"
+          } >> "$GITHUB_STEP_SUMMARY"
