@@ -6,6 +6,14 @@
 // 随消费模块一起进模块图，去重、分包（懒加载视图只带自己的组件 css）、
 // HMR 全部交给 vite/rollup 原生管道，插件自身零构建状态。
 //
+// 【运行阶段】本插件不设 enforce（normal 顺序）：vite 内置 TS/JSX 转换
+// （vite 5–7 的 vite:esbuild 按 tsconfig 的 jsx 选项、vite 8 的 oxc）先
+// 剥离类型并编译 JSX，插件到达时拿到纯 ESM JS——正是 es-module-lexer 的
+// 解析面。唯一例外：tsconfig "jsx": "preserve" 的 vite 5–7 项目 JSX 会
+// 原样保留到本插件，lexer 无法解析原始 JSX——捕获 ParseError 后降级为
+// 注释剥离 + 正则扫描（与旧项目内实现同款，见 transform），并 warn：
+// 降级模式下字符串字面量里的形似 import 文本可能被误识别（已知边界）。
+//
 // 【与项目内实现的关键差异】本包是独立 npm 包，插件代码位于消费项目的
 // node_modules 深处，因此 haze-ui 的解析基准必须是**导入方模块**而非插件
 // 自身——transform(code, id) 的 id 即导入方文件，用 createRequire(id) 做
@@ -43,7 +51,7 @@
 // tokens.css 恒定先行——主题变量/spacing/排版基线都在其中，经去重后落在
 // 模块图最前端（入口文件亦导入 haze-ui）。haze-ui 无全局 reset（无
 // body/html/* 规则），不存在漏引基础样式的风险。
-import {parse} from 'es-module-lexer';
+import {parse, type Import} from 'es-module-lexer';
 import fs from 'node:fs';
 import {createRequire} from 'node:module';
 import {dirname, isAbsolute, join, resolve} from 'node:path';
@@ -215,6 +223,24 @@ function splitSpecs(body: string): string[] {
   return out;
 }
 
+// 具名导入体 → names 集合：跳过 inline type 修饰符与空段（尾逗号）。
+// lexer 主路径与正则降级路径共用。
+function addSpecs(names: Set<string>, body: string): void {
+  for (const spec of splitSpecs(body)) {
+    const name = spec.replace(/\s+as\s+\S+$/, '').trim();
+    if (!name || /^type\s+/.test(name)) continue;
+    names.add(name);
+  }
+}
+
+// —— 正则降级路径辅助（仅 es-module-lexer 解析失败时启用，见 transform）——
+// 与旧项目内实现同款：先剥离注释，再匹配具名/命名空间导入。已知边界：
+// 字符串/模板字面量里的形似 import 文本会被误命中。
+const stripComments = (code: string) =>
+  code.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // haze-ui ≥1.22 随包发布的映射清单（dist/css-manifest.json）。三态：
 // absent（未随包发布，走 FAMILY/NO_CSS fallback）/ present（唯一映射源）/
 // broken（文件在场但 JSON 坏或形状不对——报错而非静默降级：发布侧 bug
@@ -363,9 +389,9 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
   const pkg = options.packageName ?? 'haze-ui';
   const tokensSpec = `${pkg}/css/tokens.css`;
 
-  // 具名导入识别交给 es-module-lexer（见 transform）：注释/字符串/模板/
-  // 正则里的形似 import 天然不匹配，且直接给出语句区间与模块名，无需
-  // 正则与注释剥离。
+  // 具名导入识别主路径交给 es-module-lexer（见 transform）：注释/字符串/
+  // 模板/正则里的形似 import 天然不匹配，且直接给出语句区间与模块名；
+  // lexer 解析失败时降级为 stripComments + 正则扫描（同文件头「运行阶段」）。
 
   // dev server 的根相对 id（如 '/src/App.tsx'）不是磁盘路径时，按
   // config.root 补全；configResolved 未跑（如测试直调）时退回 cwd。
@@ -373,9 +399,8 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
 
   return {
     name: 'vite-plugin-haze-ui:haze-css',
-    // 先于 vite:esbuild 的 TS 剥离跑，才能看到原始具名导入
-    // （inline `type` 修饰符否则已被移除）
-    enforce: 'pre',
+    // 不设 enforce：normal 顺序保证运行在 vite 内置 TS/JSX 转换之后
+    //（运行阶段契约见文件头注释）。
     configResolved(config) {
       root = config.root;
     },
@@ -398,28 +423,56 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
 
       // es-module-lexer 词法识别：字符串里的伪 import 不再误注入，'//' 在
       // 字符串/正则里也不再吞掉同行的真实 import（旧 stripComments 的
-      // 两类缺陷同时消除）。
-      const [imports] = parse(code, id);
+      // 两类缺陷同时消除）。lexer 对原始 JSX/未知新语法会抛 ParseError——
+      // 正常管线里到达本插件时已是纯 ESM JS（见文件头「运行阶段」），
+      // 唯一例外（tsconfig "jsx": "preserve" 的 vite 5–7）降级为正则扫描。
+      let imports: readonly Import[];
+      let lexed = true;
+      try {
+        [imports] = parse(code, id);
+      } catch (e) {
+        this.warn(
+          `[vite-plugin-haze-ui] ${file}：es-module-lexer 无法解析该模块` +
+            `（${e instanceof Error ? e.message : String(e)}），降级为正则扫描。` +
+            '字符串/注释里的形似 import 文本可能被误注入。'
+        );
+        lexed = false;
+        imports = [];
+      }
 
       let namespace = false;
       const names = new Set<string>();
-      for (const im of imports) {
-        if (im.type !== 'static' || im.typeOnly || im.specifier !== pkg) continue;
-        const stmt = code.slice(im.importStart, im.importEnd);
-        // export {X} from / export * from 'haze-ui'（lexer 会列入）不收集：
-        // 文档化边界（转发不注入）
-        if (stmt.startsWith('export')) continue;
-        if (/^import\s*\*/.test(stmt)) {
-          namespace = true;
-          continue;
+      if (lexed) {
+        for (const im of imports) {
+          if (im.type !== 'static' || im.typeOnly || im.specifier !== pkg)
+            continue;
+          const stmt = code.slice(im.importStart, im.importEnd);
+          // export {X} from / export * from 'haze-ui'（lexer 会列入）不收集：
+          // 文档化边界（转发不注入）
+          if (stmt.startsWith('export')) continue;
+          if (/^import\s*\*/.test(stmt)) {
+            namespace = true;
+            continue;
+          }
+          const body = bracedSpecs(stmt);
+          if (body === null) continue; // 纯 default / 副作用导入
+          addSpecs(names, body);
         }
-        const body = bracedSpecs(stmt);
-        if (body === null) continue; // 纯 default / 副作用导入
-        for (const spec of splitSpecs(body)) {
-          const name = spec.replace(/\s+as\s+\S+$/, '').trim();
-          // 跳过 inline type 修饰符与空段（尾逗号）
-          if (!name || /^type\s+/.test(name)) continue;
-          names.add(name);
+      } else {
+        const clean = stripComments(code);
+        const namedRe = new RegExp(
+          `import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escapeRegExp(pkg)}['"]`,
+          'g'
+        );
+        for (const m of clean.matchAll(namedRe)) {
+          if (m[1] !== undefined) addSpecs(names, m[1]);
+        }
+        if (
+          new RegExp(
+            `import\\s*\\*\\s*as\\s+\\w+\\s*from\\s*['"]${escapeRegExp(pkg)}['"]`
+          ).test(clean)
+        ) {
+          namespace = true;
         }
       }
       if (namespace) {

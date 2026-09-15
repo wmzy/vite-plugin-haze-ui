@@ -97,6 +97,47 @@ describe('vite-plugin-haze-ui', () => {
     expect(hazeCss().name).toBe('vite-plugin-haze-ui:haze-css');
   });
 
+  it('sets no enforce so it runs after the builtin TS/JSX transform', () => {
+    // 运行阶段契约：normal 顺序下到达 transform 的已是纯 ESM JS（类型已
+    // 剥离、JSX 已编译），正是 es-module-lexer 的解析面。设了 enforce:
+    // 'pre' 会先于该转换看到原始 TSX，JSX 直接令 lexer 抛 ParseError
+    //（1.0.0 缺陷：真实 React 项目任何含 JSX 的模块都会炸构建）。
+    expect(hazeCss().enforce).toBeUndefined();
+  });
+
+  it('injects from post-transform ESM on the lexer path without warnings', async () => {
+    const {consumer} = await fixture();
+    const code =
+      `import {jsx as _jsx} from "react/jsx-runtime";\n` +
+      `import {Button} from 'haze-ui';\n` +
+      `export const App = () => _jsx("div", {children: _jsx("span")});\n`;
+    const {result, warn} = run(hazeCss(), code, consumer);
+    expect(warn).not.toHaveBeenCalled();
+    expect(injected(result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ]);
+  });
+
+  it('falls back to regex scan with a warning when the lexer cannot parse (raw JSX)', async () => {
+    const {tmp} = await fixture();
+    const consumer = join(tmp, 'App.tsx');
+    await fs.promises.writeFile(consumer, '');
+    // 点号标签 + 属性表达式 + 自闭合子件的 JSX 令 lexer 抛 ParseError
+    //（文本子件反而会被宽容解析——逐形态探测后选定的稳定触发式；真实
+    // 炸点与 painless 集成 1.0.0 时的形态一致）。
+    const code =
+      `import {Button} from 'haze-ui'; ` +
+      `export const App = () => <Theme.Provider value={x}><Button /></Theme.Provider>;\n`;
+    const {result, warn} = run(hazeCss(), code, consumer);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('es-module-lexer');
+    expect(injected(result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ]);
+  });
+
   it('injects tokens.css + family css, tokens first', async () => {
     const {consumer} = await fixture();
     const code = `import {Button} from 'haze-ui';\nexport const x = 1;\n`;

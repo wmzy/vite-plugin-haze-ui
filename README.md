@@ -33,9 +33,9 @@ import hazeCss from 'vite-plugin-haze-ui';
 
 export default defineConfig({
   plugins: [
-    // Must run before React/esbuild transforms strip the TS syntax.
-    // The plugin sets `enforce: 'pre'` itself, so the position in the
-    // array is not load-bearing — put it wherever reads best.
+    // Runs at normal order — after Vite's builtin TS/JSX transform — so it
+    // always sees valid ESM JS (types stripped, JSX compiled). The plugin
+    // sets no `enforce`; array position is not load-bearing.
     hazeCss(),
     react()
   ]
@@ -45,6 +45,7 @@ export default defineConfig({
 Notes:
 
 - Import the full component styles manually is no longer needed anywhere; remove your old `haze-ui/styles.css` / per-component css import list.
+- The plugin intentionally sets no `enforce`: Vite's builtin TS/JSX transform runs first (Vite 5–7: `vite:esbuild` honoring the tsconfig `jsx` option; Vite 8: oxc), so the plugin lexes clean ESM. The one exception is `"jsx": "preserve"` in tsconfig on Vite 5–7, where JSX survives to this stage; the lexer cannot parse raw JSX, so the plugin warns and falls back to a comment-stripping regex scan — import-shaped text inside string literals may then be misread (legacy boundary).
 - `tokens.css` is always injected first for every consuming module — theme variables, spacing and typographic baselines all live there. Rollup dedupes it to the earliest module in the graph (your entry), guaranteeing it precedes all component css. haze-ui has no global reset, so there is no missing-baseline risk.
 - Vitest does not need this plugin: haze-ui ≥1.11 ships pure-ESM JS with zero css imports, so tests can run Node-direct.
 
@@ -76,7 +77,7 @@ Resolution base is the *consumer module* (`transform(code, id)`'s `id`), not the
 - Only **direct named imports** from `haze-ui` are recognized. Re-exports through a local barrel (`export {X} from 'haze-ui'`) are not collected — import from `haze-ui` directly in the consuming module.
 - **Namespace imports** (`import * as haze from 'haze-ui'`) collect nothing; the plugin warns and suggests named imports.
 - File-level granularity: importing a component anywhere in a file injects its css for that file (then deduped by the bundler).
-- Scanning is lexical (`es-module-lexer`): comments, strings, template literals and regex literals are never misread — import-shaped text inside them neither injects css nor suppresses a real import. `import type` statements and inline `type` specifiers are skipped.
+- Scanning is lexical (`es-module-lexer`) over post-transform ESM: comments, strings, template literals and regex literals are never misread — import-shaped text inside them neither injects css nor suppresses a real import. `import type` statements and inline `type` specifiers are skipped (the builtin transform strips them earlier anyway). When the lexer cannot parse the module (raw JSX reaching the plugin from a `jsx: "preserve"` tsconfig), the plugin warns and falls back to the legacy regex scan, whose boundaries are the old ones: import-shaped text inside strings may be misread.
 - Handled source extensions: `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.mts`, `.cjs`, `.cts`. Other file types (`.vue` SFCs, etc.) are passed through untouched.
 
 ## Development

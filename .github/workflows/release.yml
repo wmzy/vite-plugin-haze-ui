@@ -187,7 +187,7 @@ jobs:
             if (hazeCss !== hazeCssDefault) throw new Error('named export differs from default export');
             const plugin = hazeCssDefault();
             if (plugin.name !== 'vite-plugin-haze-ui:haze-css') throw new Error('unexpected plugin name: ' + plugin.name);
-            if (plugin.enforce !== 'pre') throw new Error('enforce !== pre');
+            if (plugin.enforce !== undefined) throw new Error('unexpected enforce: ' + plugin.enforce);
             if (typeof plugin.transform !== 'function') throw new Error('transform hook missing');
             console.log('smoke ok —', plugin.name);
           "
