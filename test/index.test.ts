@@ -364,6 +364,49 @@ describe('vite-plugin-haze-ui', () => {
     ]);
   });
 
+  it('injects the dependencies closure after the own family css', async () => {
+    // 前科回归：Button 的 loading 挂 Spinner —— 家族 1:1 映射下
+    // css/button.css 里没有 spinner 的规则，按需注入漏样式。manifest
+    // 的 dependencies（dist JS import 图推演）把闭包带进注入集。
+    const {tmp, consumer, manifestPath} = await fixture();
+    const cssDir = join(tmp, 'node_modules', 'haze-ui', 'css');
+    await fs.promises.writeFile(join(cssDir, 'spinner.css'), '/* spinner.css */\n');
+    await fs.promises.writeFile(
+      manifestPath,
+      JSON.stringify({...GOOD_MANIFEST, dependencies: {Button: ['spinner']}})
+    );
+    await fs.promises.utimes(
+      manifestPath,
+      new Date('2000-01-01'),
+      new Date('2026-01-01')
+    );
+    const code = `import {Button} from 'haze-ui';\n`;
+    expect(injected(run(hazeCss(), code, consumer).result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";',
+      'import "haze-ui/css/spinner.css";'
+    ]);
+  });
+
+  it('tolerates a manifest without the dependencies field (old haze-ui)', async () => {
+    // 旧包没有 dependencies —— undefined 即空闭包，不得炸
+    const {consumer, manifestPath} = await fixture();
+    const raw: {families: object; noCss: string[]; dependencies?: object} = {
+      ...GOOD_MANIFEST
+    };
+    await fs.promises.writeFile(manifestPath, JSON.stringify(raw));
+    await fs.promises.utimes(
+      manifestPath,
+      new Date('2000-01-01'),
+      new Date('2026-01-01')
+    );
+    const code = `import {Button} from 'haze-ui';\n`;
+    expect(injected(run(hazeCss(), code, consumer).result!)).toEqual([
+      'import "haze-ui/css/tokens.css";',
+      'import "haze-ui/css/button.css";'
+    ]);
+  });
+
   it('appends the resolution cause when package exports hide ./css/*', async () => {
     const {tmp} = await fixture();
     // exports 只暴露 tokens → 组件 css 的 resolve 抛

@@ -246,7 +246,13 @@ const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // broken（文件在场但 JSON 坏或形状不对——报错而非静默降级：发布侧 bug
 // 伪装成「无 manifest」会倒退回模板猜测映射，正是该文件要消灭的漂移面）。
 // 进程内按安装位置读一次。
-type CssManifest = {families: Record<string, string>; noCss: string[]};
+type CssManifest = {
+  families: Record<string, string>;
+  noCss: string[];
+  // 导出 → 传递闭包内*其他* css 家族（split-css 从 dist JS import 图
+  // 推演）；旧包无此字段，缺省视为无依赖。
+  dependencies?: Record<string, string[]>;
+};
 type ManifestState =
   | {kind: 'absent'}
   | {kind: 'present'; manifest: CssManifest}
@@ -282,7 +288,7 @@ function readManifest(cssDir: string): ManifestState {
   if (!fs.existsSync(path)) return {kind: 'absent'};
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(path, 'utf8'));
-    const {families, noCss} = (parsed ?? {}) as Partial<CssManifest>;
+    const {families, noCss, dependencies} = (parsed ?? {}) as Partial<CssManifest>;
     if (
       typeof families !== 'object' ||
       families === null ||
@@ -290,7 +296,7 @@ function readManifest(cssDir: string): ManifestState {
     ) {
       throw new Error('形状不符，期望 {families: {…}, noCss: […]}');
     }
-    return {kind: 'present', manifest: {families, noCss}};
+    return {kind: 'present', manifest: {families, noCss, dependencies}};
   } catch (e) {
     return {
       kind: 'broken',
@@ -522,14 +528,36 @@ export default function hazeCss(options: HazeCssOptions = {}): Plugin {
         `修复：升级 ${pkg}（新版本可能已含该 css 或已在 manifest 登记），` +
         '或对 vite-plugin-haze-ui 上报映射缺口（manifest 缺席时为 FAMILY/NO_CSS 表）。';
 
+      // 每个具名导入展开为 [自身 family css, ...传递闭包依赖 css]：
+      // manifest 的 dependencies 字段（haze-ui 新版本随包发布）记录
+      // dist JS import 图推演出的跨家族依赖（如 Button loading 挂
+      // Spinner），旧版 manifest 无此字段时退化为单文件——推断错位
+      // 的唯一后果是 <Button loading> 等场景缺样式（升级 haze-ui 即补全）。
       const specs = [
         tokensSpec,
         ...[...names]
-          .map((n) => {
+          .flatMap((n) => {
             const {file: base, covered} = cssFileOf(n, manifest);
-            if (base === null) return null;
-            const spec = `${pkg}/css/${base}.css`;
-            if (!covered) this.error(missingCss(n, spec, true));
+            if (base === null) return [];
+            const specs0: {file: string; primary: boolean}[] = [
+              {file: base, primary: true},
+            ];
+            if (manifest.kind === 'present') {
+              for (const dep of manifest.manifest.dependencies?.[n] ?? []) {
+                specs0.push({file: dep, primary: false});
+              }
+            }
+            return {n, covered, specs0};
+          })
+          .map(({n, covered, specs0}) => {
+            if (!covered) {
+              // specs0[0] 恒为自身 family 条目（构造处保证非空）
+              this.error(missingCss(n, `${pkg}/css/${specs0[0]!.file}.css`, true));
+            }
+            return specs0.map((s) => ({n, spec: `${pkg}/css/${s.file}.css`}));
+          })
+          .flat()
+          .map(({n, spec}) => {
             try {
               resolveCss(req, install, spec);
             } catch (e) {
